@@ -4,17 +4,15 @@
 AC_PREREQ(2.60)
 
 define([VERSION_MAJOR], [1])
-define([VERSION_MINOR], [0])
+define([VERSION_MINOR], [1])
 define([VERSION_FIX], [1])
 define([VERSION_NUMBER], VERSION_MAJOR[.]VERSION_MINOR[.]VERSION_FIX)
 define([VERSION_SUFFIX], [_master])
 
 dnl Set to "1" for a first RPM release of a new version
-PACKAGE_RPM_RELEASE="0.0.$(echo VERSION_SUFFIX | sed 's/^_//')"
+PACKAGE_RPM_RELEASE="0.0.$(echo VERSION_SUFFIX | sed s/^_//)"
 
 AC_INIT([netdata], VERSION_NUMBER[]VERSION_SUFFIX)
-
-AM_CONDITIONAL([GIT_TREE], [test -f README.md])
 
 AM_MAINTAINER_MODE([disable])
 if test x"$USE_MAINTAINER_MODE" = xyes; then
@@ -166,6 +164,7 @@ AC_CONFIG_FILES([
 	src/Makefile
 	system/Makefile
 	web/Makefile
+	contrib/Makefile
 ])
 AC_OUTPUT
 

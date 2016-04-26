@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <time.h>
 
 #ifndef NETDATA_LOG_H
 #define NETDATA_LOG_H 1
@@ -24,6 +25,7 @@
 #define D_RRD_CALLS			0x00020000
 #define D_DICTIONARY		0x00040000
 #define D_MEMORY			0x00080000
+#define D_CGROUP            0x00100000
 
 //#define DEBUG (D_WEB_CLIENT_ACCESS|D_LISTENER|D_RRD_STATS)
 //#define DEBUG 0xffffffff
@@ -41,6 +43,12 @@ extern FILE *stdaccess;
 extern int access_log_syslog;
 extern int error_log_syslog;
 extern int output_log_syslog;
+
+extern time_t error_log_throttle_period;
+extern unsigned long error_log_errors_per_period;
+extern int error_log_limit(int reset);
+
+#define error_log_limit_reset() do { error_log_limit(1); } while(0)
 
 #define debug(type, args...) do { if(unlikely(!silent && (debug_flags & type))) debug_int(__FILE__, __FUNCTION__, __LINE__, ##args); } while(0)
 #define info(args...)    info_int(__FILE__, __FUNCTION__, __LINE__, ##args)

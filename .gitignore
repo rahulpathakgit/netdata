@@ -32,7 +32,6 @@ netdata.spec
 .cproject
 .idea/
 .project
-CMakeLists.txt
 README
 TODO.md
 asan_symbolize.py
@@ -61,6 +60,15 @@ web/version.txt
 
 system/netdata-openrc
 system/netdata-init-d
+system/netdata.logrotate
 
 netdata-installer.log
 netdata-uninstaller.sh
+
+gmon.out
+gmon.txt
+apps.plugin-profiler.sh
+
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake

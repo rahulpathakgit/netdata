@@ -50,10 +50,12 @@ netdata_SOURCES = \
 	proc_net_snmp.c \
 	proc_net_snmp6.c \
 	proc_net_stat_conntrack.c \
+	proc_net_stat_synproxy.c \
 	proc_stat.c \
 	proc_sys_kernel_random_entropy_avail.c \
 	proc_vmstat.c \
 	sys_kernel_mm_ksm.c \
+	sys_fs_cgroup.c \
 	procfile.c procfile.h \
 	rrd.c rrd.h \
 	rrd2json.c rrd2json.h \

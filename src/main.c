@@ -37,6 +37,8 @@
 
 #include "main.h"
 
+extern void *cgroups_main(void *ptr);
+
 int netdata_exit = 0;
 
 void netdata_cleanup_and_exit(int ret)
@@ -44,6 +46,9 @@ void netdata_cleanup_and_exit(int ret)
 	netdata_exit = 1;
 	rrdset_save_all();
 	// kill_childs();
+
+	// let it log a few more error messages
+	error_log_limit_reset();
 
 	if(pidfd != -1) {
 		if(ftruncate(pidfd, 0) != 0)
@@ -80,6 +85,7 @@ struct netdata_static_thread static_threads[] = {
 	{"tc",			"plugins",	"tc",			1, NULL, NULL,	tc_main},
 	{"idlejitter",	"plugins",	"idlejitter",	1, NULL, NULL,	cpuidlejitter_main},
 	{"proc",		"plugins",	"proc",			1, NULL, NULL,	proc_main},
+	{"cgroups",		"plugins",	"cgroups",		1, NULL, NULL,	cgroups_main},
 
 #ifdef INTERNAL_PLUGIN_NFACCT
 	// nfacct requires root access
@@ -344,6 +350,12 @@ int main(int argc, char **argv)
 		}
 		else error_log_syslog = 0;
 
+		error_log_throttle_period = config_get_number("global", "errors flood protection period", error_log_throttle_period);
+		setenv("NETDATA_ERRORS_THROTTLE_PERIOD", config_get("global", "errors flood protection period"    , ""), 1);
+
+		error_log_errors_per_period = config_get_number("global", "errors to trigger flood protection", error_log_errors_per_period);
+		setenv("NETDATA_ERRORS_PER_PERIOD"     , config_get("global", "errors to trigger flood protection", ""), 1);
+
 		// --------------------------------------------------------------------
 
 		access_log_file = config_get("global", "access log", LOG_DIR "/access.log");
@@ -420,8 +432,13 @@ int main(int argc, char **argv)
 
 		// --------------------------------------------------------------------
 
+		// get the user we should run
+		// IMPORTANT: this is required before web_files_uid()
 		user = config_get("global", "run as user"    , (getuid() == 0)?NETDATA_USER:"");
-		web_files_uid();
+
+		// IMPORTANT: these have to run once, while single threaded
+		web_files_uid(); // IMPORTANT: web_files_uid() before web_files_gid()
+		web_files_gid();
 
 		// --------------------------------------------------------------------
 

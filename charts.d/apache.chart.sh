@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # the URL to download apache status info
 apache_url="http://127.0.0.1:80/server-status?auto"
@@ -94,7 +94,7 @@ apache_detect() {
 
 apache_get() {
 	local oIFS="${IFS}" ret
-	IFS=$':\n' apache_response=($(curl -s "${apache_url}"))
+	IFS=$':\n' apache_response=($(curl -Ss "${apache_url}"))
 	ret=$?
 	IFS="${oIFS}"
 
