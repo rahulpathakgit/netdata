@@ -16,6 +16,7 @@
 #include "rrd.h"
 #include "main.h"
 #include "popen.h"
+#include "proc_self_mountinfo.h"
 
 // ----------------------------------------------------------------------------
 // cgroup globals
@@ -31,31 +32,47 @@ static char *cgroup_blkio_base = NULL;
 static char *cgroup_memory_base = NULL;
 
 static int cgroup_root_count = 0;
-static int cgroup_root_max = 50;
+static int cgroup_root_max = 500;
 static int cgroup_max_depth = 0;
 
 void read_cgroup_plugin_configuration() {
-	cgroup_check_for_new_every = config_get_number("plugin:cgroups", "check for new plugin every", cgroup_check_for_new_every);
+	cgroup_check_for_new_every = config_get_number("plugin:cgroups", "check for new cgroups every", cgroup_check_for_new_every);
 
 	cgroup_enable_cpuacct_stat = config_get_boolean_ondemand("plugin:cgroups", "enable cpuacct stat", cgroup_enable_cpuacct_stat);
 	cgroup_enable_cpuacct_usage = config_get_boolean_ondemand("plugin:cgroups", "enable cpuacct usage", cgroup_enable_cpuacct_usage);
 	cgroup_enable_memory = config_get_boolean_ondemand("plugin:cgroups", "enable memory", cgroup_enable_memory);
 	cgroup_enable_blkio = config_get_boolean_ondemand("plugin:cgroups", "enable blkio", cgroup_enable_blkio);
 
-	char filename[FILENAME_MAX + 1];
-	snprintf(filename, FILENAME_MAX, "%s%s", global_host_prefix, "/sys/fs/cgroup/cpuacct");
+	char filename[FILENAME_MAX + 1], *s;
+	struct mountinfo *mi, *root = mountinfo_read();
+
+	mi = mountinfo_find_by_filesystem_mount_source(root, "cgroup", "cpuacct");
+	if(!mi) mi = mountinfo_find_by_filesystem_super_option(root, "cgroup", "cpuacct");
+	if(!mi) s = "/sys/fs/cgroup/cpuacct";
+	else s = mi->mount_point;
+	snprintf(filename, FILENAME_MAX, "%s%s", global_host_prefix, s);
 	cgroup_cpuacct_base = config_get("plugin:cgroups", "path to /sys/fs/cgroup/cpuacct", filename);
 
-	snprintf(filename, FILENAME_MAX, "%s%s", global_host_prefix, "/sys/fs/cgroup/blkio");
+	mi = mountinfo_find_by_filesystem_mount_source(root, "cgroup", "blkio");
+	if(!mi) mi = mountinfo_find_by_filesystem_super_option(root, "cgroup", "blkio");
+	if(!mi) s = "/sys/fs/cgroup/blkio";
+	else s = mi->mount_point;
+	snprintf(filename, FILENAME_MAX, "%s%s", global_host_prefix, s);
 	cgroup_blkio_base = config_get("plugin:cgroups", "path to /sys/fs/cgroup/blkio", filename);
 
-	snprintf(filename, FILENAME_MAX, "%s%s", global_host_prefix, "/sys/fs/cgroup/memory");
+	mi = mountinfo_find_by_filesystem_mount_source(root, "cgroup", "memory");
+	if(!mi) mi = mountinfo_find_by_filesystem_super_option(root, "cgroup", "memory");
+	if(!mi) s = "/sys/fs/cgroup/memory";
+	else s = mi->mount_point;
+	snprintf(filename, FILENAME_MAX, "%s%s", global_host_prefix, s);
 	cgroup_memory_base = config_get("plugin:cgroups", "path to /sys/fs/cgroup/memory", filename);
 
 	cgroup_root_max = config_get_number("plugin:cgroups", "max cgroups to allow", cgroup_root_max);
 	cgroup_max_depth = config_get_number("plugin:cgroups", "max cgroups depth to monitor", cgroup_max_depth);
 
 	cgroup_enable_new_cgroups_detected_at_runtime = config_get_boolean("plugin:cgroups", "enable new cgroups detected at run time", cgroup_enable_new_cgroups_detected_at_runtime);
+
+	mountinfo_free(root);
 }
 
 // ----------------------------------------------------------------------------
@@ -141,13 +158,14 @@ struct cpuacct_usage {
 };
 
 struct cgroup {
-	int available;
-	int enabled;
+	int available;		// found in the filesystem
+	int enabled;		// enabled in the config
 
 	char *id;
 	uint32_t hash;
 
 	char *chart_id;
+	char *chart_title;
 
 	struct cpuacct_stat cpuacct_stat;
 	struct cpuacct_usage cpuacct_usage;
@@ -241,12 +259,13 @@ void cgroup_read_cpuacct_usage(struct cpuacct_usage *ca) {
 
 		if(i != ca->cpus) {
 			free(ca->cpu_percpu);
-		}
-		ca->cpu_percpu = malloc(sizeof(unsigned long long) * i);
-		if(!ca->cpu_percpu)
-			fatal("Cannot allocate memory (%z bytes)", sizeof(unsigned long long) * i);
 
-		ca->cpus = i;
+			ca->cpu_percpu = malloc(sizeof(unsigned long long) * i);
+			if(!ca->cpu_percpu)
+				fatal("Cannot allocate memory (%z bytes)", sizeof(unsigned long long) * i);
+
+			ca->cpus = i;
+		}
 
 		for(i = 0; i < ca->cpus ;i++) {
 			ca->cpu_percpu[i] = strtoull(procfile_lineword(ff, 0, i), NULL, 10);
@@ -555,7 +574,7 @@ void read_all_cgroups(struct cgroup *root) {
 	struct cgroup *cg;
 
 	for(cg = root; cg ; cg = cg->next)
-		if(cg->enabled)
+		if(cg->enabled && cg->available)
 			cgroup_read(cg);
 }
 
@@ -589,13 +608,22 @@ void cgroup_get_chart_id(struct cgroup *cg) {
 		debug(D_CGROUP, "cgroup '%s' should be renamed to '%s'", cg->id, s);
 
 		trim(s);
-		netdata_fix_chart_id(s);
+
+		free(cg->chart_title);
+		cg->chart_title = strdup(s);
+		if(!cg->chart_title)
+			fatal("CGROUP: Cannot allocate memory for chart name of cgroup '%s' chart name: '%s'", cg->id, s);
+
+		netdata_fix_chart_name(cg->chart_title);
+
 		free(cg->chart_id);
 		cg->chart_id = strdup(s);
 		if(!cg->chart_id)
 			fatal("CGROUP: Cannot allocate memory for chart id of cgroup '%s' chart id: '%s'", cg->id, s);
 
-		debug(D_CGROUP, "cgroup '%s' renamed to '%s'", cg->id, cg->chart_id);
+		netdata_fix_chart_id(cg->chart_id);
+
+		debug(D_CGROUP, "cgroup '%s' renamed to '%s' (title: '%s')", cg->id, cg->chart_id, cg->chart_title);
 	}
 	else debug(D_CGROUP, "cgroup '%s' is not to be renamed (will be shown as '%s')", cg->id, cg->chart_id);
 }
@@ -613,18 +641,41 @@ struct cgroup *cgroup_add(const char *id) {
 	if(!*chart_id) {
 		chart_id = "/";
 
-		// disable by default the host cgroup
+		// disable by default the root cgroup
 		def = 0;
-		debug(D_CGROUP, "cgroup '%s' is the host container (by default %s)", id, (def)?"enabled":"disabled");
+		debug(D_CGROUP, "cgroup '%s' is the root container (by default %s)", id, (def)?"enabled":"disabled");
 	}
 	else {
 		if(*chart_id == '/') chart_id++;
 
+		size_t len = strlen(chart_id);
+
 		// disable by default the parent cgroup
 		// for known cgroup managers
-		if(!strcmp(chart_id, "lxc") || !strcmp(chart_id, "docker")) {
+		if(!strcmp(chart_id, "lxc") ||
+				!strcmp(chart_id, "docker") ||
+				!strcmp(chart_id, "libvirt") ||
+				!strcmp(chart_id, "qemu") ||
+				!strcmp(chart_id, "systemd") ||
+				!strcmp(chart_id, "system.slice") ||
+				!strcmp(chart_id, "machine.slice") ||
+				!strcmp(chart_id, "user") ||
+				!strcmp(chart_id, "system") ||
+				!strcmp(chart_id, "machine") ||
+		   		// starts with them
+				(len >  6 && !strncmp(chart_id, "user/", 6)) ||
+				(len > 11 && !strncmp(chart_id, "user.slice/", 11)) ||
+				// ends with them
+				(len >  5 && !strncmp(&chart_id[len -  5], ".user", 5)) ||
+				(len >  5 && !strncmp(&chart_id[len -  5], ".swap", 5)) ||
+				(len >  6 && !strncmp(&chart_id[len -  6], ".slice", 6)) ||
+				(len >  6 && !strncmp(&chart_id[len -  6], ".mount", 6)) ||
+				(len >  8 && !strncmp(&chart_id[len -  8], ".session", 8)) ||
+				(len >  8 && !strncmp(&chart_id[len -  8], ".service", 8)) ||
+				(len > 10 && !strncmp(&chart_id[len - 10], ".partition", 10))
+				) {
 			def = 0;
-			debug(D_CGROUP, "cgroup '%s' is container manager (by default %s)", id, (def)?"enabled":"disabled");
+			debug(D_CGROUP, "cgroup '%s' is %s (by default)", id, (def)?"enabled":"disabled");
 		}
 	}
 
@@ -641,6 +692,9 @@ struct cgroup *cgroup_add(const char *id) {
 	cg->chart_id = strdup(chart_id);
 	if(!cg->chart_id) fatal("Cannot allocate memory for cgroup '%s'", id);
 
+	cg->chart_title = strdup(chart_id);
+	if(!cg->chart_title) fatal("Cannot allocate memory for cgroup '%s'", id);
+
 	if(!cgroup_root)
 		cgroup_root = cg;
 	else {
@@ -652,38 +706,20 @@ struct cgroup *cgroup_add(const char *id) {
 
 	cgroup_root_count++;
 
-	// fprintf(stderr, " > added cgroup No %d, with id '%s' (%u) and name '%s'\n", cgroup_root_count, cg->id, cg->hash, cg->name);
-
 	// fix the name by calling the external script
 	cgroup_get_chart_id(cg);
 
 	char option[FILENAME_MAX + 1];
-	snprintf(option, FILENAME_MAX, "enable cgroup %s", cg->chart_id);
+	snprintf(option, FILENAME_MAX, "enable cgroup %s", cg->chart_title);
 	cg->enabled = config_get_boolean("plugin:cgroups", option, def);
-	debug(D_CGROUP, "finally: new cgroup '%s' is named '%s' and is %s (default was %s)", cg->id, cg->chart_id, (cg->enabled)?"enabled":"disabled", (def)?"enabled":"disabled");
+
+	debug(D_CGROUP, "Added cgroup '%s' with chart id '%s' and title '%s' as %s (default was %s)", cg->id, cg->chart_id, cg->chart_title, (cg->enabled)?"enabled":"disabled", (def)?"enabled":"disabled");
 
 	return cg;
 }
 
-void cgroup_remove(struct cgroup *cg) {
-	debug(D_CGROUP, "removing cgroup '%s'", cg->id);
-
-	if(cg == cgroup_root) {
-		cgroup_root = cg->next;
-	}
-	else {
-		struct cgroup *e;
-		for(e = cgroup_root; e->next ;e = e->next)
-			if(unlikely(e->next == cg)) break;
-
-		if(e->next != cg) {
-			error("Cannot find cgroup '%s' in list of cgroups", cg->id);
-		}
-		else {
-			e->next = cg->next;
-			cg->next = NULL;
-		}
-	}
+void cgroup_free(struct cgroup *cg) {
+	debug(D_CGROUP, "Removing cgroup '%s' with chart id '%s' (was %s and %s)", cg->id, cg->chart_id, (cg->enabled)?"enabled":"disabled", (cg->available)?"available":"not available");
 
 	free(cg->cpuacct_usage.cpu_percpu);
 
@@ -699,7 +735,10 @@ void cgroup_remove(struct cgroup *cg) {
 
 	free(cg->id);
 	free(cg->chart_id);
+	free(cg->chart_title);
 	free(cg);
+
+	cgroup_root_count--;
 }
 
 // find if a given cgroup exists
@@ -708,15 +747,13 @@ struct cgroup *cgroup_find(const char *id) {
 
 	uint32_t hash = simple_hash(id);
 
-	// fprintf(stderr, " > searching for '%s' (%u)\n", id, hash);
-
 	struct cgroup *cg;
 	for(cg = cgroup_root; cg ; cg = cg->next) {
 		if(hash == cg->hash && strcmp(id, cg->id) == 0)
 			break;
 	}
 
-	debug(D_CGROUP, "cgroup '%s' %s", id, (cg)?"found":"not found");
+	debug(D_CGROUP, "cgroup_find('%s') %s", id, (cg)?"found":"not found");
 	return cg;
 }
 
@@ -724,7 +761,7 @@ struct cgroup *cgroup_find(const char *id) {
 // detect running cgroups
 
 // callback for find_file_in_subdirs()
-void found_dir_in_subdir(const char *dir) {
+void found_subdir_in_dir(const char *dir) {
 	debug(D_CGROUP, "examining cgroup dir '%s'", dir);
 
 	struct cgroup *cg = cgroup_find(dir);
@@ -750,13 +787,15 @@ void found_dir_in_subdir(const char *dir) {
 }
 
 void find_dir_in_subdirs(const char *base, const char *this, void (*callback)(const char *)) {
+	int enabled = -1;
 	if(!this) this = base;
 	size_t dirlen = strlen(this), baselen = strlen(base);
+	const char *relative_path = &this[baselen];
 
 	DIR *dir = opendir(this);
 	if(!dir) return;
 
-	callback(&this[baselen]);
+	callback(relative_path);
 
 	struct dirent *de = NULL;
 	while((de = readdir(dir))) {
@@ -770,13 +809,29 @@ void find_dir_in_subdirs(const char *base, const char *this, void (*callback)(co
 		debug(D_CGROUP, "examining '%s/%s'", this, de->d_name);
 
 		if(de->d_type == DT_DIR) {
-			char *s = malloc(dirlen + strlen(de->d_name) + 2);
-			if(s) {
-				strcpy(s, this);
-				strcat(s, "/");
-				strcat(s, de->d_name);
-				find_dir_in_subdirs(base, s, callback);
-				free(s);
+			if(enabled == -1) {
+				const char *r = relative_path;
+				if(*r == '\0') r = "/";
+				else if (*r == '/') r++;
+
+				// we check for this option here
+				// so that the config will not have settings
+				// for leaf directories
+				char option[FILENAME_MAX + 1];
+				snprintf(option, FILENAME_MAX, "search for cgroups under %s", r);
+				option[FILENAME_MAX] = '\0';
+				enabled = config_get_boolean("plugin:cgroups", option, 1);
+			}
+
+			if(enabled) {
+				char *s = malloc(dirlen + strlen(de->d_name) + 2);
+				if(s) {
+					strcpy(s, this);
+					strcat(s, "/");
+					strcat(s, de->d_name);
+					find_dir_in_subdirs(base, s, callback);
+					free(s);
+				}
 			}
 		}
 	}
@@ -794,30 +849,54 @@ void mark_all_cgroups_as_not_available() {
 		cg->available = 0;
 }
 
-struct cgroup *find_all_cgroups() {
+void cleanup_all_cgroups() {
+	struct cgroup *cg = cgroup_root, *last = NULL;
+
+	for(; cg ;) {
+		if(!cg->available) {
+
+			if(!last)
+				cgroup_root = cg->next;
+			else
+				last->next = cg->next;
+
+			cgroup_free(cg);
+
+			if(!last)
+				cg = cgroup_root;
+			else
+				cg = last->next;
+		}
+		else {
+			last = cg;
+			cg = cg->next;
+		}
+	}
+}
+
+void find_all_cgroups() {
 	debug(D_CGROUP, "searching for cgroups");
 
 	mark_all_cgroups_as_not_available();
 
 	if(cgroup_enable_cpuacct_stat || cgroup_enable_cpuacct_usage)
-		find_dir_in_subdirs(cgroup_cpuacct_base, NULL, found_dir_in_subdir);
+		find_dir_in_subdirs(cgroup_cpuacct_base, NULL, found_subdir_in_dir);
 
 	if(cgroup_enable_blkio)
-		find_dir_in_subdirs(cgroup_blkio_base, NULL, found_dir_in_subdir);
+		find_dir_in_subdirs(cgroup_blkio_base, NULL, found_subdir_in_dir);
 
 	if(cgroup_enable_memory)
-		find_dir_in_subdirs(cgroup_memory_base, NULL, found_dir_in_subdir);
+		find_dir_in_subdirs(cgroup_memory_base, NULL, found_subdir_in_dir);
+
+	// remove any non-existing cgroups
+	cleanup_all_cgroups();
 
 	struct cgroup *cg;
 	for(cg = cgroup_root; cg ; cg = cg->next) {
 		// fprintf(stderr, " >>> CGROUP '%s' (%u - %s) with name '%s'\n", cg->id, cg->hash, cg->available?"available":"stopped", cg->name);
 
-		if(!cg->available) {
-			// do not remove the cgroup
-			// it will be added back on the next scan
-			// cgroup_remove(cg);
+		if(unlikely(!cg->available))
 			continue;
-		}
 
 		debug(D_CGROUP, "checking paths for cgroup '%s'", cg->id);
 
@@ -874,7 +953,7 @@ struct cgroup *find_all_cgroups() {
 	}
 
 	debug(D_CGROUP, "done searching for cgroups");
-	return cgroup_root;
+	return;
 }
 
 // ----------------------------------------------------------------------------
@@ -892,10 +971,11 @@ void update_cgroup_charts(int update_every) {
 	RRDSET *st;
 
 	for(cg = cgroup_root; cg ; cg = cg->next) {
-		if(!cg->available || !cg->enabled) continue;
+		if(!cg->available || !cg->enabled)
+			continue;
 
 		if(cg->id[0] == '\0')
-			strcpy(type, "cgroup_host");
+			strcpy(type, "cgroup_root");
 		else if(cg->id[0] == '/')
 			snprintf(type, RRD_ID_LENGTH_MAX, "cgroup_%s", cg->chart_id);
 		else
@@ -906,7 +986,7 @@ void update_cgroup_charts(int update_every) {
 		if(cg->cpuacct_stat.updated) {
 			st = rrdset_find_bytype(type, "cpu");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "CPU Usage for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "CPU Usage for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "cpu", NULL, "cpu", "cgroup.cpu", title, "%", 40000, update_every, RRDSET_TYPE_STACKED);
 
 				rrddim_add(st, "user", NULL, 100, hz, RRDDIM_INCREMENTAL);
@@ -925,7 +1005,7 @@ void update_cgroup_charts(int update_every) {
 
 			st = rrdset_find_bytype(type, "cpu_per_core");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "CPU Usage Per Core for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "CPU Usage Per Core for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "cpu_per_core", NULL, "cpu", "cgroup.cpu_per_core", title, "%", 40100, update_every, RRDSET_TYPE_STACKED);
 
 				for(i = 0; i < cg->cpuacct_usage.cpus ;i++) {
@@ -946,7 +1026,7 @@ void update_cgroup_charts(int update_every) {
 			if(cg->memory.cache + cg->memory.rss + cg->memory.rss_huge + cg->memory.mapped_file > 0) {
 				st = rrdset_find_bytype(type, "mem");
 				if(!st) {
-					snprintf(title, CHART_TITLE_MAX, "Memory Usage for cgroup %s", cg->chart_id);
+					snprintf(title, CHART_TITLE_MAX, "Memory Usage for cgroup %s", cg->chart_title);
 					st = rrdset_create(type, "mem", NULL, "mem", "cgroup.mem", title, "MB", 40200, update_every,
 					                   RRDSET_TYPE_STACKED);
 
@@ -970,7 +1050,7 @@ void update_cgroup_charts(int update_every) {
 
 			st = rrdset_find_bytype(type, "writeback");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "Writeback Memory for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "Writeback Memory for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "writeback", NULL, "mem", "cgroup.writeback", title, "MB", 40300,
 				                   update_every, RRDSET_TYPE_AREA);
 
@@ -988,7 +1068,7 @@ void update_cgroup_charts(int update_every) {
 			if(cg->memory.pgpgin + cg->memory.pgpgout > 0) {
 				st = rrdset_find_bytype(type, "mem_activity");
 				if(!st) {
-					snprintf(title, CHART_TITLE_MAX, "Memory Activity for cgroup %s", cg->chart_id);
+					snprintf(title, CHART_TITLE_MAX, "Memory Activity for cgroup %s", cg->chart_title);
 					st = rrdset_create(type, "mem_activity", NULL, "mem", "cgroup.mem_activity", title, "MB/s",
 					                   40400, update_every, RRDSET_TYPE_LINE);
 
@@ -1005,7 +1085,7 @@ void update_cgroup_charts(int update_every) {
 			if(cg->memory.pgfault + cg->memory.pgmajfault > 0) {
 				st = rrdset_find_bytype(type, "pgfaults");
 				if(!st) {
-					snprintf(title, CHART_TITLE_MAX, "Memory Page Faults for cgroup %s", cg->chart_id);
+					snprintf(title, CHART_TITLE_MAX, "Memory Page Faults for cgroup %s", cg->chart_title);
 					st = rrdset_create(type, "pgfaults", NULL, "mem", "cgroup.pgfaults", title, "MB/s", 40500,
 					                   update_every, RRDSET_TYPE_LINE);
 
@@ -1023,7 +1103,7 @@ void update_cgroup_charts(int update_every) {
 		if(cg->io_service_bytes.updated && cg->io_service_bytes.Read + cg->io_service_bytes.Write > 0) {
 			st = rrdset_find_bytype(type, "io");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "I/O Bandwidth (all disks) for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "I/O Bandwidth (all disks) for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "io", NULL, "disk", "cgroup.io", title, "KB/s", 41200,
 				                   update_every, RRDSET_TYPE_LINE);
 
@@ -1040,7 +1120,7 @@ void update_cgroup_charts(int update_every) {
 		if(cg->io_serviced.updated && cg->io_serviced.Read + cg->io_serviced.Write > 0) {
 			st = rrdset_find_bytype(type, "serviced_ops");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "Serviced I/O Operations (all disks) for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "Serviced I/O Operations (all disks) for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "serviced_ops", NULL, "disk", "cgroup.serviced_ops", title, "operations/s", 41200,
 				                   update_every, RRDSET_TYPE_LINE);
 
@@ -1057,7 +1137,7 @@ void update_cgroup_charts(int update_every) {
 		if(cg->throttle_io_service_bytes.updated && cg->throttle_io_service_bytes.Read + cg->throttle_io_service_bytes.Write > 0) {
 			st = rrdset_find_bytype(type, "io");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "Throttle I/O Bandwidth (all disks) for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "Throttle I/O Bandwidth (all disks) for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "io", NULL, "disk", "cgroup.io", title, "KB/s", 41200,
 				                   update_every, RRDSET_TYPE_LINE);
 
@@ -1075,7 +1155,7 @@ void update_cgroup_charts(int update_every) {
 		if(cg->throttle_io_serviced.updated && cg->throttle_io_serviced.Read + cg->throttle_io_serviced.Write > 0) {
 			st = rrdset_find_bytype(type, "throttle_serviced_ops");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "Throttle Serviced I/O Operations (all disks) for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "Throttle Serviced I/O Operations (all disks) for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "throttle_serviced_ops", NULL, "disk", "cgroup.throttle_serviced_ops", title, "operations/s", 41200,
 				                   update_every, RRDSET_TYPE_LINE);
 
@@ -1092,7 +1172,7 @@ void update_cgroup_charts(int update_every) {
 		if(cg->io_queued.updated) {
 			st = rrdset_find_bytype(type, "queued_ops");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "Queued I/O Operations (all disks) for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "Queued I/O Operations (all disks) for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "queued_ops", NULL, "disk", "cgroup.queued_ops", title, "operations", 42000,
 				                   update_every, RRDSET_TYPE_LINE);
 
@@ -1109,7 +1189,7 @@ void update_cgroup_charts(int update_every) {
 		if(cg->io_merged.updated && cg->io_merged.Read + cg->io_merged.Write > 0) {
 			st = rrdset_find_bytype(type, "merged_ops");
 			if(!st) {
-				snprintf(title, CHART_TITLE_MAX, "Merged I/O Operations (all disks) for cgroup %s", cg->chart_id);
+				snprintf(title, CHART_TITLE_MAX, "Merged I/O Operations (all disks) for cgroup %s", cg->chart_title);
 				st = rrdset_create(type, "merged_ops", NULL, "disk", "cgroup.merged_ops", title, "operations/s", 42100,
 				                   update_every, RRDSET_TYPE_LINE);
 
@@ -1169,7 +1249,7 @@ void *cgroups_main(void *ptr)
 
 	// when ZERO, attempt to do it
 	int vdo_sys_fs_cgroup 			= 0;
-	int vdo_cpu_netdata 			= !config_get_boolean("plugin:cgroups", "netdata server resources", 1);
+	int vdo_cpu_netdata 			= !config_get_boolean("plugin:cgroups", "cgroups plugin resources", 1);
 
 	// keep track of the time each module was called
 	unsigned long long sutime_sys_fs_cgroup = 0ULL;
